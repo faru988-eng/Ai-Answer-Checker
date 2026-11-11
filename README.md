@@ -45,3 +45,42 @@
 - Do not upload sensitive student information unless you have permission and are comfortable sending those images to the AI provider.
 - API usage may incur charges or be subject to the provider's free-tier limits.
 - The current MVP keeps results in Streamlit session memory. Download the CSV before closing or refreshing the session.
+
+
+## Smart Teacher Assistant (development branch)
+
+This branch adds teacher/student accounts and a classroom workflow.
+
+### Run locally
+
+```bash
+git clone -b feature/teacher-student-platform https://github.com/faru988-eng/Ai-Answer-Checker.git
+cd Ai-Answer-Checker
+python -m venv .venv
+# Windows:
+.venv\\Scripts\\activate
+# macOS/Linux:
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+### First-time setup
+
+1. Open the app and create a **Teacher** account.
+2. Copy the class join code shown in the sidebar.
+3. Give that code to students so they can create Student accounts.
+4. Add your Gemini API key in the sidebar to use the AI chatbot and test generator.
+5. Upload PDF, DOCX or TXT teaching material in **Chatbot & Materials**.
+6. Generate and publish MCQ tests, and assign learning tasks from the teacher menu.
+
+### Current development scope
+
+- Passwords are stored as PBKDF2-HMAC-SHA256 hashes with individual salts.
+- SQLite stores accounts, class materials, tests, results and student learning progress.
+- Students see tests and learning tasks for the class code they joined.
+- The original handwritten answer checker is preserved in `legacy_answer_checker.py`.
+
+### Important deployment note
+
+This is an initial local prototype. Before public deployment, configure a production database, HTTPS, secrets management, rate limiting, account recovery, backups and stronger classroom/teacher authorization. Uploaded documents are currently text-extracted from PDF/DOCX/TXT; scanned PDFs need OCR before their contents can be used by the chatbot.
