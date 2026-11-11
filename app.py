@@ -1,286 +1,295 @@
-import json
-import re
+import hashlib, json, secrets, re, runpy
 from io import BytesIO
-
 import streamlit as st
-from PIL import Image
-from google import genai
-from google.genai import types
+import database as db
 
-st.set_page_config(page_title="AI Answer Checker", page_icon="📝", layout="wide")
+st.set_page_config(page_title="Smart Teacher Assistant", page_icon="🎓", layout="wide")
+db.init_db()
 
-st.title("📝 AI Answer Checker")
-st.caption("Upload handwritten answer sheets, review AI feedback, edit marks, and confirm each copy.")
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    value = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 310000).hex()
+    return value, salt
 
-# ---------- Helpers ----------
-def extract_json(text):
-    """Handle JSON returned with or without Markdown code fences."""
-    text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if match:
-            return json.loads(match.group(0))
-        raise ValueError("The AI response was not valid JSON. Please try again.")
+def check_password(password, user):
+    value, _ = hash_password(password, user["salt"])
+    return secrets.compare_digest(value, user["password_hash"])
 
-def analyze_copy(api_key, question, reference_answer, max_marks, images):
-    client = genai.Client(api_key=api_key)
-    prompt = f"""
-You are a careful, fair school-exam answer checker.
-Question: {question}
-Teacher's reference answer: {reference_answer}
-Maximum marks: {max_marks}
+def read_file(file):
+    data = file.getvalue()
+    if file.name.lower().endswith(".txt"):
+        return data.decode("utf-8", errors="replace")
+    if file.name.lower().endswith(".pdf"):
+        from pypdf import PdfReader
+        return "\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(data)).pages)
+    if file.name.lower().endswith(".docx"):
+        from docx import Document
+        return "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+    raise ValueError("Only PDF, DOCX and TXT are supported.")
 
-The attached image(s) are pages from ONE student's answer to this question.
-Read the handwriting carefully. Combine the pages in their supplied order.
-Evaluate meaning, correct facts, relevant points, and completeness. Do not require
-the student's wording to exactly match the reference answer. Do not invent text
-that is not visible. If handwriting is unclear, mention that uncertainty.
-Award partial credit fairly. Never exceed the maximum marks or go below zero.
+def ai_client(key):
+    from google import genai
+    return genai.Client(api_key=key)
 
-Return ONLY valid JSON with this exact structure:
-{{
-  "extracted_answer": "the student's readable answer, preserving its meaning",
-  "marks": 0,
-  "mistakes": ["specific mistake or missing point"],
-  "strengths": ["correct point identified"],
-  "feedback": "short teacher-style feedback",
-  "confidence": "High, Medium, or Low"
-}}
-"""
-    content = [prompt]
-    for uploaded in images:
-        uploaded.seek(0)
-        img = Image.open(uploaded).convert("RGB")
-        content.append(img)
+def parse_json(value):
+    value = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", value or "", flags=re.I)
+    return json.loads(value)
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=content,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
-    )
-    data = extract_json(response.text)
-    data["marks"] = max(0.0, min(float(max_marks), float(data.get("marks", 0))))
-    for key in ("mistakes", "strengths"):
-        if not isinstance(data.get(key), list):
-            data[key] = []
-    return data
+# ---------- Login / registration ----------
+if "user" not in st.session_state:
+    st.title("🎓 Smart Teacher Assistant")
+    st.write("A shared learning platform for teachers and students.")
+    login_tab, signup_tab = st.tabs(["Login", "Create account"])
+    with login_tab:
+        with st.form("login"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            go = st.form_submit_button("Login", type="primary", use_container_width=True)
+        if go:
+            account = db.get_user_by_email(email.strip())
+            if account and check_password(password, account):
+                st.session_state.user = account
+                st.rerun()
+            st.error("Incorrect email or password.")
+    with signup_tab:
+        role = st.radio("I am a", ["Teacher", "Student"], horizontal=True)
+        with st.form("signup"):
+            name = st.text_input("Full name")
+            new_email = st.text_input("Email address")
+            new_password = st.text_input("Password (minimum 8 characters)", type="password")
+            confirm = st.text_input("Confirm password", type="password")
+            code = st.text_input("Teacher's class code") if role == "Student" else ""
+            create = st.form_submit_button("Create account", type="primary")
+        if create:
+            if not name.strip() or not new_email.strip() or not new_password:
+                st.error("Complete all fields.")
+            elif len(new_password) < 8:
+                st.error("Password must contain at least 8 characters.")
+            elif new_password != confirm:
+                st.error("Passwords do not match.")
+            elif role == "Student" and not db.get_teacher_by_code(code.strip()):
+                st.error("Class code not found. Ask your teacher for the correct code.")
+            else:
+                digest, salt = hash_password(new_password)
+                class_code = secrets.token_hex(3).upper() if role == "Teacher" else code.strip().upper()
+                try:
+                    db.create_user(name.strip(), new_email.strip(), digest, salt, role.lower(), class_code)
+                    st.success("Account created. Please log in.")
+                    if role == "Teacher":
+                        st.info(f"Your class code is {class_code}. Share it with your students.")
+                except Exception:
+                    st.error("This email may already be registered.")
+    st.stop()
 
-def init_session():
-    defaults = {
-        "started": False,
-        "question": "",
-        "reference": "",
-        "max_marks": 10,
-        "copy_count": 1,
-        "copy_uploads": {},
-        "results": [],
-        "current_index": 0,
-        "analysis": None,
-        "analysis_for_index": None,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+user = st.session_state.user
+st.sidebar.title("🎓 Smart Teacher")
+st.sidebar.write(f"Signed in: **{user['name']}**")
+st.sidebar.caption(user["role"].title())
+if user["role"] == "teacher":
+    st.sidebar.success(f"Student join code: {user['class_code']}")
+if st.sidebar.button("Log out", use_container_width=True):
+    del st.session_state["user"]
+    st.rerun()
+api_key = st.sidebar.text_input("Gemini API key", type="password",
+    help="Used for the chatbot and AI test generation. Keep your key private.")
 
-init_session()
+# ===================== TEACHER =====================
+if user["role"] == "teacher":
+    st.title("👩‍🏫 Teacher Dashboard")
+    page = st.sidebar.radio("Teacher menu", [
+        "Overview", "AI Answer Checker", "Chatbot & Materials",
+        "Create Tests", "Learning Tasks", "Students & Results"
+    ])
 
-# ---------- Setup ----------
-if not st.session_state.started:
-    st.subheader("1. Set up the checking session")
-    with st.form("setup_form"):
-        question = st.text_area("Question", placeholder="Enter the exam question...")
-        reference = st.text_area("Correct / reference answer", height=180,
-                                 placeholder="Enter the answer you want the students' answers compared against...")
-        c1, c2 = st.columns(2)
-        with c1:
-            max_marks = st.number_input("Maximum marks", min_value=1, max_value=100,
-                                        value=10, step=1)
-        with c2:
-            copy_count = st.number_input("Number of copies", min_value=1, max_value=200,
-                                         value=5, step=1)
-        submitted = st.form_submit_button("Start checking", type="primary", use_container_width=True)
+    if page == "Overview":
+        stats = db.get_dashboard_stats(user["id"])
+        a,b,c,d = st.columns(4)
+        a.metric("Students", stats["students"])
+        b.metric("Tests", stats["tests"])
+        c.metric("Test attempts", stats["attempts"])
+        d.metric("Class average", f"{stats['average']}%")
+        st.subheader("Recent results")
+        rows = db.get_teacher_results(user["id"])
+        st.dataframe(rows[:10], use_container_width=True) if rows else st.info("No student submissions yet.")
 
-    if submitted:
-        if not question.strip() or not reference.strip():
-            st.error("Please enter both the question and the reference answer.")
-        else:
-            st.session_state.question = question.strip()
-            st.session_state.reference = reference.strip()
-            st.session_state.max_marks = int(max_marks)
-            st.session_state.copy_count = int(copy_count)
-            st.session_state.started = True
+    elif page == "AI Answer Checker":
+        st.header("📝 Handwritten Answer Checker")
+        st.write("Your existing Gemini image checker is preserved in this module.")
+        runpy.run_path("legacy_answer_checker.py")
+
+    elif page == "Chatbot & Materials":
+        st.header("📚 Upload teaching material")
+        files = st.file_uploader("Upload PDF, DOCX or TXT", type=["pdf","docx","txt"], accept_multiple_files=True)
+        if files and st.button("Save materials"):
+            for f in files:
+                try:
+                    content = read_file(f)
+                    if content.strip():
+                        db.add_material(user["id"], f.name, content)
+                    else:
+                        st.warning(f"No readable text found in {f.name}. Scanned PDFs need OCR.")
+                except Exception as exc:
+                    st.error(f"{f.name}: {exc}")
+            st.success("Materials saved to your account.")
             st.rerun()
+        materials = db.get_materials(user["id"])
+        st.subheader("Your knowledge library")
+        for m in materials:
+            st.write(f"📄 {m['filename']} · {len(m['content'])} characters")
+        st.divider()
+        prompt = st.text_area("Ask something from your uploaded material",
+            placeholder="Summarize a chapter, explain a topic, or create revision notes...")
+        if st.button("Ask AI assistant", type="primary", disabled=not api_key or not prompt.strip()):
+            if not materials:
+                st.warning("Upload study material first.")
+            else:
+                source = "\n\n".join(f"FILE: {m['filename']}\n{m['content'][:18000]}" for m in materials)
+                instruction = ("You are a teacher's study assistant. Answer using the provided material only. "
+                    "If the answer is not present, say so. Never invent facts. Mention relevant source filenames.\n\n"
+                    f"MATERIAL:\n{source[:60000]}\n\nQUESTION:\n{prompt}")
+                try:
+                    with st.spinner("Reading your material..."):
+                        answer = ai_client(api_key).models.generate_content(
+                            model="gemini-2.0-flash", contents=instruction)
+                    st.session_state.teacher_chat_answer = answer.text
+                except Exception as exc:
+                    st.error(f"AI request failed: {exc}")
+        if st.session_state.get("teacher_chat_answer"):
+            st.subheader("Answer")
+            st.write(st.session_state.teacher_chat_answer)
 
-# ---------- Copy-by-copy workflow ----------
+    elif page == "Create Tests":
+        st.header("🧪 Generate tests from your material")
+        materials = db.get_materials(user["id"])
+        with st.form("test_generation"):
+            title = st.text_input("Test title")
+            subject = st.text_input("Subject")
+            topic = st.text_area("Topic / chapter / instructions")
+            amount = st.number_input("Number of MCQs", 1, 30, 5)
+            source_from_files = st.checkbox("Use my uploaded materials", value=bool(materials))
+            generate = st.form_submit_button("Generate test with AI", type="primary")
+        if generate:
+            if not api_key:
+                st.error("Enter your Gemini API key in the sidebar.")
+            elif source_from_files and not materials:
+                st.error("Upload material in Chatbot & Materials first.")
+            else:
+                source = ("\n\n".join(m["content"][:15000] for m in materials)[:50000]
+                          if source_from_files else topic)
+                if not source.strip():
+                    st.error("Enter a topic or upload material.")
+                else:
+                    instruction = f"""Create {int(amount)} student-friendly MCQs based only on this source.
+Return valid JSON only: {{"questions":[{{"question":"...","options":["...","...","...","..."],"correct":"A","explanation":"..."}}]}}
+Correct must be A, B, C or D. Do not add facts not in the source.
+SOURCE:
+{source}"""
+                    try:
+                        with st.spinner("Creating questions..."):
+                            response = ai_client(api_key).models.generate_content(
+                                model="gemini-2.0-flash", contents=instruction)
+                        questions = parse_json(response.text)["questions"]
+                        questions = [q for q in questions if len(q.get("options",[])) == 4 and q.get("correct") in ["A","B","C","D"]]
+                        if questions:
+                            st.session_state.test_draft = {
+                                "title": title.strip() or "New test",
+                                "subject": subject.strip() or "General",
+                                "questions": questions
+                            }
+                        else:
+                            st.error("No valid MCQs returned. Try again.")
+                    except Exception as exc:
+                        st.error(f"Test generation failed: {exc}")
+        draft = st.session_state.get("test_draft")
+        if draft:
+            st.subheader("Review before publishing")
+            for i,q in enumerate(draft["questions"],1):
+                st.markdown(f"**{i}. {q['question']}**")
+                for letter, option in zip("ABCD", q["options"]):
+                    st.write(f"{letter}. {option}")
+                st.caption(f"Answer: {q['correct']} — {q.get('explanation','')}")
+            if st.button("Publish test to my students", type="primary"):
+                db.add_test(user["id"], draft["title"], draft["subject"], "Choose the best answer.", draft["questions"])
+                del st.session_state["test_draft"]
+                st.success("Test published for students in your class.")
+                st.rerun()
+
+    elif page == "Learning Tasks":
+        st.header("📌 Assign learning tasks")
+        with st.form("new_task"):
+            task_title = st.text_input("What should students learn?")
+            task_subject = st.text_input("Subject")
+            details = st.text_area("Pages, key points or preparation instructions")
+            assign = st.form_submit_button("Assign to class", type="primary")
+        if assign:
+            if task_title.strip() and task_subject.strip():
+                db.add_learning_task(user["id"], task_title, task_subject, details)
+                st.success("Task assigned.")
+            else:
+                st.warning("Enter task title and subject.")
+
+    elif page == "Students & Results":
+        st.header("👥 Your students")
+        students = db.get_teacher_students(user["id"])
+        st.dataframe(students, use_container_width=True) if students else st.info("No students have joined. Share your class code.")
+        st.subheader("Test results")
+        results = db.get_teacher_results(user["id"])
+        st.dataframe(results, use_container_width=True) if results else st.info("No test results yet.")
+        if results:
+            import pandas as pd
+            st.download_button("Download CSV", pd.DataFrame(results).to_csv(index=False),
+                               "class_results.csv", "text/csv")
+
+# ===================== STUDENT =====================
 else:
-    total = st.session_state.copy_count
-    idx = st.session_state.current_index
-
-    with st.sidebar:
-        st.header("Session")
-        st.write(f"**Question:** {st.session_state.question}")
-        st.write(f"**Maximum marks:** {st.session_state.max_marks}")
-        st.write(f"**Copies:** {total}")
-        st.progress(min(len(st.session_state.results) / total, 1.0))
-        st.write(f"Confirmed: **{len(st.session_state.results)} / {total}**")
-        if st.button("Start a new session", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-
-    if idx < total:
-        st.subheader(f"2. Copy {idx + 1} of {total}")
-        st.caption("You can upload more than one page for the same student's answer. Upload pages in reading order.")
-
-        uploads = st.file_uploader(
-            f"Upload photo(s) for copy {idx + 1}",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key=f"uploader_{idx}",
-            help="Use clear, well-lit photos. Each upload here belongs to this one student's copy.",
-        )
-        student_name = st.text_input(
-            "Student name / roll number (optional)",
-            value=st.session_state.copy_uploads.get(idx, {}).get("student", ""),
-            key=f"student_{idx}",
-        )
-        st.session_state.copy_uploads[idx] = {
-            "student": student_name,
-            "files": uploads,
-        }
-
-        api_key = st.text_input(
-            "Gemini API key",
-            type="password",
-            key="gemini_api_key",
-            help="Get an API key from Google AI Studio. It is used only for this app session.",
-        )
-
-        if uploads:
-            cols = st.columns(min(3, len(uploads)))
-            for i, file in enumerate(uploads):
-                with cols[i % len(cols)]:
-                    st.image(file, caption=f"Page {i + 1}", use_container_width=True)
-
-        if st.button("Check this copy with AI", type="primary",
-                     disabled=not uploads or not api_key.strip(),
-                     use_container_width=True):
-            try:
-                with st.spinner("Reading handwriting and evaluating the answer..."):
-                    result = analyze_copy(
-                        api_key.strip(),
-                        st.session_state.question,
-                        st.session_state.reference,
-                        st.session_state.max_marks,
-                        uploads,
-                    )
-                st.session_state.analysis = result
-                st.session_state.analysis_for_index = idx
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not check this copy: {e}")
-                st.info("Check your internet connection and Gemini API key. You can retry.")
-
-        if st.session_state.analysis is not None and st.session_state.analysis_for_index == idx:
-            st.divider()
-            st.subheader("3. Review and edit AI assessment")
-            result = st.session_state.analysis
-
-            st.info(f"AI confidence: {result.get('confidence', 'Not provided')}. Please review before confirming.")
-            extracted = st.text_area(
-                "Extracted student answer — edit if handwriting was misread",
-                value=result.get("extracted_answer", ""),
-                height=180,
-                key=f"extracted_{idx}",
-            )
-            marks = st.number_input(
-                "Marks awarded",
-                min_value=0.0,
-                max_value=float(st.session_state.max_marks),
-                value=float(result.get("marks", 0)),
-                step=0.5,
-                key=f"marks_{idx}",
-            )
-            mistakes_text = st.text_area(
-                "Mistakes / missing points (one per line)",
-                value="\n".join(result.get("mistakes", [])),
-                height=120,
-                key=f"mistakes_{idx}",
-            )
-            strengths_text = st.text_area(
-                "Correct points / strengths (one per line)",
-                value="\n".join(result.get("strengths", [])),
-                height=100,
-                key=f"strengths_{idx}",
-            )
-            feedback = st.text_area(
-                "Teacher feedback",
-                value=result.get("feedback", ""),
-                height=90,
-                key=f"feedback_{idx}",
-            )
-
-            if st.button("Continue — confirm marks and next copy",
-                         type="primary", use_container_width=True):
-                st.session_state.results.append({
-                    "copy_number": idx + 1,
-                    "student": student_name.strip() or f"Copy {idx + 1}",
-                    "answer": extracted,
-                    "marks": float(marks),
-                    "max_marks": st.session_state.max_marks,
-                    "mistakes": [x.strip() for x in mistakes_text.splitlines() if x.strip()],
-                    "strengths": [x.strip() for x in strengths_text.splitlines() if x.strip()],
-                    "feedback": feedback.strip(),
-                })
-                st.session_state.current_index += 1
-                st.session_state.analysis = None
-                st.session_state.analysis_for_index = None
-                st.rerun()
-
+    st.title(f"🎒 Student Dashboard — {user['name']}")
+    page = st.sidebar.radio("Student menu", ["My Learning Tasks", "Available Tests", "My Results"])
+    if page == "My Learning Tasks":
+        st.header("📚 What I need to learn")
+        tasks = db.get_student_tasks(user["class_code"], user["id"])
+        if not tasks:
+            st.info("Your teacher has not assigned any learning tasks yet.")
+        for task in tasks:
+            with st.container(border=True):
+                st.subheader(task["title"])
+                st.caption(task["subject"])
+                st.write(task["details"])
+                states = ["To learn", "Learning", "Learned", "Need revision"]
+                current = task["status"] if task["status"] in states else states[0]
+                selected = st.selectbox("My progress", states, index=states.index(current),
+                                        key=f"progress_{task['id']}")
+                if selected != current:
+                    db.set_task_status(task["id"], user["id"], selected)
+                    st.success("Progress saved.")
+    elif page == "Available Tests":
+        st.header("📝 Tests assigned to your class")
+        tests = db.get_student_tests(user["class_code"])
+        if not tests:
+            st.info("No tests are available yet.")
+        for test in tests:
+            with st.container(border=True):
+                st.subheader(test["title"])
+                st.caption(test["subject"])
+                if db.student_has_attempted(test["id"], user["id"]):
+                    st.success("Submitted")
+                    continue
+                with st.form(f"attempt_{test['id']}"):
+                    answers = []
+                    for i,q in enumerate(test["questions"]):
+                        st.markdown(f"**Q{i+1}. {q['question']}**")
+                        choice = st.radio("Choose answer",
+                            [f"A. {q['options'][0]}",f"B. {q['options'][1]}",
+                             f"C. {q['options'][2]}",f"D. {q['options'][3]}"],
+                            key=f"ans_{test['id']}_{i}")
+                        answers.append(choice[0])
+                    submit = st.form_submit_button("Submit test", type="primary")
+                if submit:
+                    score = sum(a == q["correct"] for a,q in zip(answers,test["questions"]))
+                    total = len(test["questions"])
+                    db.save_test_result(test["id"], user["id"], answers, score, total)
+                    st.success(f"Your score: {score}/{total}")
+                    st.rerun()
     else:
-        st.balloons()
-        st.subheader("✅ All copies checked")
-        st.write(f"Confirmed marks for **{len(st.session_state.results)}** copies.")
-
-        rows = []
-        for r in st.session_state.results:
-            rows.append({
-                "Copy": r["copy_number"],
-                "Student": r["student"],
-                "Marks": r["marks"],
-                "Out of": r["max_marks"],
-                "Percentage": round((r["marks"] / r["max_marks"]) * 100, 1),
-            })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-
-        csv_lines = ["Copy,Student,Marks,Out of,Percentage,Feedback"]
-        for r in st.session_state.results:
-            pct = round((r["marks"] / r["max_marks"]) * 100, 1)
-            safe_student = '"' + r["student"].replace('"', '""') + '"'
-            safe_feedback = '"' + r["feedback"].replace('"', '""') + '"'
-            csv_lines.append(f'{r["copy_number"]},{safe_student},{r["marks"]},{r["max_marks"]},{pct},{safe_feedback}')
-        st.download_button(
-            "Download marks as CSV",
-            data="\n".join(csv_lines),
-            file_name="answer_checking_results.csv",
-            mime="text/csv",
-            type="primary",
-            use_container_width=True,
-        )
-
-        with st.expander("View detailed feedback for each copy"):
-            for r in st.session_state.results:
-                st.markdown(f"**{r['student']} — {r['marks']} / {r['max_marks']}**")
-                st.write(r["feedback"])
-                if r["mistakes"]:
-                    st.write("Mistakes / missing points:", ", ".join(r["mistakes"]))
-                if r["strengths"]:
-                    st.write("Correct points:", ", ".join(r["strengths"]))
-                st.divider()
+        st.header("🏆 My results")
+        results = db.get_student_results(user["id"])
+        st.dataframe(results, use_container_width=True) if results else st.info("You have not attempted any tests yet.")
